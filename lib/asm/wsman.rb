@@ -1215,12 +1215,15 @@ module ASM
     # Find the specified boot device in {#boot_source_settings}
     #
     # @param [Symbol|String] :hdd for "Hard drive C", :virtual_cd for "Virtual Optical Drive" or the device FQDD such as
-    #                        HardDisk.List.1-1, Optical.iDRACVirtual.1-1 or NIC.Slot.2-2-1
+    #                        HardDisk.List.1-1, Optical.iDRACVirtual.1-1 or NIC.Slot.2-2-1, :uefi_virtual_floppy for
+    #                        UEFI "Virtual Floppy Drive" such as UefiBootSeq#Floppy.iDRACVirtual.1-1
     # @return [Hash] the boot device, or nil if not found
     # @raise [ResponseError] if a command fails
     def find_boot_device(boot_device)
       boot_settings = boot_source_settings
-      boot_order_map = {:hdd => "HardDisk.List.1-1", :virtual_cd => "Optical.iDRACVirtual.1-1"}
+      boot_order_map = {:hdd => "HardDisk.List.1-1",
+                        :virtual_cd => "Optical.iDRACVirtual.1-1",
+                        :uefi_virtual_floppy => "UefiBootSeq#Floppy.iDRACVirtual.1-1"}
       boot_device = Parser.enum_value("BootDevice", boot_order_map,
                                       boot_device, :strict => false)
       boot_settings.find { |e| e[:instance_id].include?("#%s#" % boot_device) }
@@ -1237,23 +1240,26 @@ module ASM
     # @option params [String] :scheduled_start_time Schedules the "configuration job" and the optional "reboot job"
     #                         at the specified start time in the format: yyyymmddhhmmss. A special value of
     #                         "TIME_NOW" schedules the job(s) immediately.
+    # @option params [String] :boot_mode Specify desired boot mode (either Bios or Uefi). defaults to Bios
     # @return [void]
     # @raise [ResponseError] if a command fails
     def set_boot_order(boot_device, options={})
       options = {:scheduled_start_time => "TIME_NOW",
                  :reboot_job_type => :graceful_with_forced_shutdown}.merge(options)
+      allowed_boot_modes = ["Bios", "Uefi"]
+      options[:boot_mode] = "Bios" unless allowed_boot_modes.include?(options[:boot_mode])
 
       logger.info("Waiting for LC ready on %s" % host)
       poll_for_lc_ready
       boot_mode = bios_enumerations.find { |e| e[:attribute_name] == "BootMode" }
       raise("BootMode not found") unless boot_mode
 
-      unless boot_mode[:current_value] == "Bios"
-        # Set back to bios boot mode
-        logger.info("Current boot mode on %s is %s, resetting to Bios BootMode" %
+      unless boot_mode[:current_value] == options[:boot_mode]
+        # Set back to desired boot mode
+        logger.info("Current boot mode on %s is %s, resetting to #{options[:boot_mode]} BootMode" %
                         [host, boot_mode[:current_value]])
         set_bios_attributes(:target => boot_mode[:fqdd], :attribute_name => "BootMode",
-                            :attribute_value => "Bios")
+                            :attribute_value => options[:boot_mode])
       end
 
       target = find_boot_device(boot_device)
@@ -1267,9 +1273,11 @@ module ASM
         return
       end
 
-      change_boot_order_by_instance_id(:instance_id => "IPL",
+      boot_instance_id_map = {"Bios" => "IPL", "Uefi" => "UEFI"}
+      change_boot_order_by_instance_id(:instance_id => boot_instance_id_map[options[:boot_mode]],
                                        :source => target[:instance_id])
-      change_boot_source_state(:instance_id => "IPL", :enabled_state => "1",
+      change_boot_source_state(:instance_id => boot_instance_id_map[options[:boot_mode]],
+                               :enabled_state => "1",
                                :source => target[:instance_id])
       run_bios_config_job(:target => boot_mode[:fqdd],
                           :scheduled_start_time => options[:scheduled_start_time],
@@ -1303,24 +1311,29 @@ module ASM
     # @option params [String] :reboot_start_time Schedules the "reboot job" at the specified start time in the
     #                         format: yyyymmddhhmmss. A special value of "TIME_NOW" schedules the job(s) immediately.
     # @option params [FixNum] :timeout (600) The number of seconds to wait for the virtual CD to become available
+    # @option params [String] :boot_mode Specify desired boot mode (either Bios or Uefi). Default to Bios
+    # @option params [String] :boot_device Specify desired boot device after attaching remote share. Values can be :hdd,
+    #                         :virtual_cd, :uefi_virtual_floppy, or device name itself.  Default to :virtual_cd
     # @return [void]
     # @raise [ResponseError] if a command fails
     def boot_rfs_iso_image(options={})
+      boot_device = options.delete(:boot_device) || :virtual_cd
       options = {:reboot_job_type => :graceful_with_forced_shutdown,
                  :reboot_start_time => "TIME_NOW",
-                 :timeout => 10 * 60}.merge(options)
+                 :timeout => 10 * 60,
+                 :boot_mode => "Bios"}.merge(options)
       connect_rfs_iso_image(options)
 
-      # Have to reboot in order for virtual cd to show up in boot source settings
+      # Have to reboot in order for virtual cd or virtual floppy to show up in boot source settings
       reboot(options)
 
       # Wait for virtual cd to show up in boot source settings
       max_sleep = 60
       ASM::Util.block_and_retry_until_ready(options[:timeout], RetryException, max_sleep) do
-        find_boot_device(:virtual_cd) || raise(RetryException)
+        find_boot_device(boot_device) || raise(RetryException)
       end
 
-      set_boot_order(:virtual_cd, options)
+      set_boot_order(boot_device, options)
 
     rescue Timeout::Error
       raise(Error, "Timed out waiting for virtual CD to become available on %s" % host)
